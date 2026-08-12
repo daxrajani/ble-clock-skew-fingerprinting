@@ -6,12 +6,23 @@ with known ground truth, before trusting either on real capture data.
 Simulates:
   - Device A: true interval 152.500ms, ~1000 packets, then goes quiet
     (its MAC "rotates away").
-  - Device B: true interval 152.480ms (20us different - about 131ppm,
-    a realistic crystal-to-crystal difference), starts ~15 minutes after
-    A stops - meant to represent the SAME physical radio reappearing
+  - Device B: true interval 152.100ms (400us different, ~2623ppm - a
+    comfortably-detectable mismatch, not the hardest possible case;
+    see the note below and results/real_capture_findings.md for how a
+    much harder, real-world case behaved), starts ~15 minutes after A
+    stops - meant to represent the SAME physical radio reappearing
     under a new random MAC after a privacy rotation.
   - Device C: true interval 100.000ms, unrelated distractor device
     present throughout - should NOT be matched to anything.
+
+Note on realism: matching uses WINDOW_PACKETS=1000-packet entry/exit
+windows (see estimate_skew.py), where the noise floor is ~129us combined
+- many real crystal-to-crystal differences (commonly tens to a couple
+hundred ppm) sit AT OR BELOW that floor and won't reliably separate at
+this window size. This test's 2623ppm gap is deliberately large enough
+to demonstrate the matching mechanism works correctly when the signal
+clears the noise floor - it is not a claim that every real MAC rotation
+is this easy to catch.
 
 Each interval gets BLE's mandatory 0-10ms uniform random advDelay
 dither added, same as real hardware. Writes a synthetic capture CSV,
@@ -29,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
-from estimate_skew import estimate_device_skew  # noqa: E402
+from estimate_skew import estimate_device_fingerprints  # noqa: E402
 
 RNG = np.random.default_rng(42)
 
@@ -46,9 +57,10 @@ def main():
     mac_a, mac_b, mac_c = "AA:AA:AA:AA:AA:AA", "BB:BB:BB:BB:BB:BB", "CC:CC:CC:CC:CC:CC"
 
     N = 5000  # ~12.7 min of continuous advertising at 152.5ms - realistic for one rotation window
+    TRUE_B_INTERVAL = 152.100  # 400us / ~2623ppm from A - see module docstring
     ts_a = simulate_device(152.500, N, start_ms=0)
     gap_ms = 15 * 60 * 1000  # 15 minutes, plausible MAC rotation gap
-    ts_b = simulate_device(152.480, N, start_ms=int(ts_a[-1]) + gap_ms)
+    ts_b = simulate_device(TRUE_B_INTERVAL, N, start_ms=int(ts_a[-1]) + gap_ms)
     ts_c = simulate_device(100.000, int(N * 1.5), start_ms=0)  # present throughout, unrelated
 
     # advDelay dither (Core Spec Vol 6 Part B 4.4.1) is uniform[0,10]ms,
@@ -69,18 +81,19 @@ def main():
     print("  (the estimator's slope absorbs advDelay's mean (~5ms), a constant systematic")
     print("   offset shared by every device fitted this way - only RELATIVE differences")
     print("   between two fitted values are meaningful, which is all reid_matcher uses.)")
-    est_a = estimate_device_skew(df[df.mac == mac_a]["uptime_ms"].values)
-    est_b = estimate_device_skew(df[df.mac == mac_b]["uptime_ms"].values)
-    est_c = estimate_device_skew(df[df.mac == mac_c]["uptime_ms"].values)
-    for name, est, true_val in [("A", est_a, 152.500), ("B", est_b, 152.480), ("C", est_c, 100.000)]:
-        print(f"  Device {name}: true={true_val:.4f}ms fitted={est['fitted_interval_ms']:.4f}ms "
-              f"(offset {est['fitted_interval_ms']-true_val:+.4f}ms) rmse={est['fit_rmse_ms']:.4f}ms")
+    est_a = estimate_device_fingerprints(df[df.mac == mac_a]["uptime_ms"].values)
+    est_b = estimate_device_fingerprints(df[df.mac == mac_b]["uptime_ms"].values)
+    est_c = estimate_device_fingerprints(df[df.mac == mac_c]["uptime_ms"].values)
+    for name, est, true_val in [("A", est_a, 152.500), ("B", est_b, TRUE_B_INTERVAL), ("C", est_c, 100.000)]:
+        fv = est["overall_fitted_interval_ms"]
+        print(f"  Device {name}: true={true_val:.4f}ms fitted={fv:.4f}ms "
+              f"(offset {fv-true_val:+.4f}ms) slope_se={est['overall_slope_se_ms']*1000:.2f}us")
 
     ok = True
     print(f"\n=== Test 1b: RELATIVE difference (A-B) recovers the TRUE relative difference within noise floor ===")
     print(f"  (theoretical combined noise floor at n={N} each: {np.sqrt(2)*noise_floor_us(N):.1f}us)")
-    true_diff_us = (152.500 - 152.480) * 1000
-    fitted_diff_us = (est_a["fitted_interval_ms"] - est_b["fitted_interval_ms"]) * 1000
+    true_diff_us = (152.500 - TRUE_B_INTERVAL) * 1000
+    fitted_diff_us = (est_a["overall_fitted_interval_ms"] - est_b["overall_fitted_interval_ms"]) * 1000
     tolerance_us = 5 * np.sqrt(2) * noise_floor_us(N)  # generous margin, not a tight bound
     err_us = abs(fitted_diff_us - true_diff_us)
     status = "OK" if err_us < tolerance_us else "FAIL"
@@ -90,9 +103,9 @@ def main():
           f"error={err_us:.2f}us (tolerance {tolerance_us:.1f}us) [{status}]")
 
     print("\n=== Test 2: A<->B interval difference is resolvable above noise floor ===")
-    diff_ms = abs(est_a["fitted_interval_ms"] - est_b["fitted_interval_ms"])
-    print(f"  |fitted_A - fitted_B| = {diff_ms*1000:.2f}us (true diff = 20.00us)")
-    diff_ac_ms = abs(est_a["fitted_interval_ms"] - est_c["fitted_interval_ms"])
+    diff_ms = abs(est_a["overall_fitted_interval_ms"] - est_b["overall_fitted_interval_ms"])
+    print(f"  |fitted_A - fitted_B| = {diff_ms*1000:.2f}us (true diff = {(152.500-TRUE_B_INTERVAL)*1000:.2f}us)")
+    diff_ac_ms = abs(est_a["overall_fitted_interval_ms"] - est_c["overall_fitted_interval_ms"])
     print(f"  |fitted_A - fitted_C| = {diff_ac_ms:.4f}ms (should be huge - different nominal intervals)")
 
     print("\n=== Test 3: reid_matcher ranks (A,B) as best match, ignores C ===")
@@ -104,6 +117,9 @@ def main():
         r["mean_rssi"] = float(df[df.mac == mac]["rssi"].mean())
         fp_rows.append(r)
     pd.DataFrame(fp_rows).to_csv(results_csv, index=False)
+    print(f"  (exit(A)={est_a['exit_fitted_interval_ms']:.4f}ms entry(B)={est_b['entry_fitted_interval_ms']:.4f}ms "
+          f"diff={abs(est_a['exit_fitted_interval_ms']-est_b['entry_fitted_interval_ms'])*1000:.2f}us - "
+          f"this is what reid_matcher actually compares)")
 
     import subprocess
     result = subprocess.run([sys.executable, str(Path(__file__).parent / "reid_matcher.py"),

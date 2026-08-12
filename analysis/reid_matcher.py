@@ -19,6 +19,12 @@ a device with only 200 packets has a noisier estimate than one with
 (same physical device shouldn't jump RSSI much across a rotation, unless
 it moved).
 
+Compares a vanished device's EXIT fingerprint (its last WINDOW_PACKETS
+packets, from estimate_skew.py) against a newly-appeared device's ENTRY
+fingerprint (its first WINDOW_PACKETS packets) - not their whole-lifetime
+fits, which drift over long spans (see estimate_skew.py's docstring and
+results/real_capture_findings.md for why this matters in practice).
+
 Usage:
     python reid_matcher.py ../results/skew_fingerprints.csv
 """
@@ -29,9 +35,19 @@ import numpy as np
 import pandas as pd
 
 MAX_GAP_S = 40 * 60      # generous upper bound on MAC rotation interval
-MIN_GAP_S = 5             # must have actually vanished first
+MIN_GAP_S = 0.001        # just a sanity floor against literal duplicate/overlap
+                          # timestamps - a real MAC rotation can be near-instant
+                          # (the radio just switches identity and keeps advertising)
 MAX_RSSI_DELTA = 15       # dB - same physical device shouldn't jump much
-INTERVAL_TOLERANCE_MS = 0.15  # absolute fallback tolerance
+# advDelay dither (std ~2.887ms) gives entry/exit windows (WINDOW_PACKETS
+# packets each, see estimate_skew.py) a combined noise floor of roughly
+# sqrt(2) * 2887ms / sqrt(WINDOW_PACKETS) - about 129us at the default
+# 1000-packet window. INTERVAL_TOLERANCE_MS is sized as a generous
+# multiple of that (not an arbitrarily chosen number, and NOT based on
+# any single observed real match - that was an earlier mistake here).
+_DITHER_STD_MS = 10 / (12 ** 0.5)
+INTERVAL_TOLERANCE_MS = 5 * (2 ** 0.5) * _DITHER_STD_MS / (1000 ** 0.5)  # ~0.65ms at WINDOW_PACKETS=1000
+SIGMA_TOLERANCE = 3
 
 
 def main():
@@ -50,15 +66,24 @@ def main():
             if not (MIN_GAP_S <= gap_s <= MAX_GAP_S):
                 continue
 
-            interval_diff = abs(vanished["fitted_interval_ms"] - appeared["fitted_interval_ms"])
-            # Combine both devices' fit uncertainty into an expected noise floor.
-            combined_rmse = np.sqrt(vanished["fit_rmse_ms"] ** 2 + appeared["fit_rmse_ms"] ** 2)
-            noise_floor = max(combined_rmse / np.sqrt(min(vanished["n_packets"], appeared["n_packets"])),
-                               0.01)
+            if pd.isna(vanished["exit_fitted_interval_ms"]) or pd.isna(appeared["entry_fitted_interval_ms"]):
+                continue
+
+            interval_diff = abs(vanished["exit_fitted_interval_ms"] - appeared["entry_fitted_interval_ms"])
+            # Combine both devices' SLOPE standard errors (not residual
+            # scatter - see estimate_skew.py's estimate_device_skew() for
+            # why that distinction mattered) into an expected noise floor.
+            noise_floor = max(np.sqrt(vanished["exit_slope_se_ms"] ** 2 + appeared["entry_slope_se_ms"] ** 2),
+                               0.001)
             sigma_distance = interval_diff / noise_floor
 
-            if interval_diff > INTERVAL_TOLERANCE_MS and sigma_distance > 3:
-                continue  # not a plausible match by either criterion
+            # Require BOTH the absolute and noise-scaled checks to pass, not
+            # either - on real (noisier-than-synthetic) data, fit_rmse gets
+            # inflated by missed-packet reconstruction error, which deflates
+            # sigma_distance for nearly every pair and made this an
+            # accidental "match almost anything" filter when it was an OR.
+            if interval_diff > INTERVAL_TOLERANCE_MS or sigma_distance > SIGMA_TOLERANCE:
+                continue
 
             rssi_delta = abs(vanished["mean_rssi"] - appeared["mean_rssi"])
             if rssi_delta > MAX_RSSI_DELTA:

@@ -75,15 +75,29 @@ that file and `results/synthetic_validation.md`.
 ## Status
 
 - [x] Firmware written, builds clean (83KB flash / 22KB RAM on
-      nrf52840dk/nrf52840).
+      nrf52840dk/nrf52840), flashed to a real DK.
 - [x] Analysis pipeline (capture → skew estimation → re-ID matching)
       implemented and validated against synthetic ground-truth data —
       see `results/synthetic_validation.md`.
-- [ ] Firmware flashed and a real multi-hour passive capture run on
-      actual ambient BLE traffic (needs the DK connected — see
-      `results/` once available).
-- [ ] Real-world re-identification demonstrated across an actual MAC
-      rotation event (needs a long enough real capture to span one).
+- [x] A full 1-hour passive capture completed: 133,210 packets, 60
+      ambient devices fingerprinted. One MAC rotation caught cleanly in
+      raw data (21ms gap, matching cadence, matching RSSI straight
+      through the transition) — the clearest real evidence the method
+      works on real hardware.
+- [x] Testing on this real capture (not just synthetic data) found and
+      fixed three real bugs in the matching pipeline — an unrealistic
+      minimum-gap assumption, error accumulation from whole-lifetime
+      fitting, and a statistical uncertainty formula that was wrong in
+      two different ways before landing on one validated against
+      synthetic ground truth. Full writeup, including the honest result
+      after all three fixes (130 candidates among 60 devices — a real
+      limitation of pairwise statistical matching in a dense RF
+      environment, not a residual bug): `results/real_capture_findings.md`.
+- [ ] A controlled experiment with a *known* device (deliberately
+      toggling a specific phone's Bluetooth off/on, as done in the
+      companion `ble-rssi-ml-classifier` project) would give a labeled
+      ground-truth pair to measure true precision/recall, rather than
+      relying on one clean example found by inspection.
 
 ## Running it yourself
 
